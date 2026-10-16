@@ -1,0 +1,642 @@
+//@version=6
+// ============================================================================
+//  SMART CONFLUENCE BUY/SELL — SIGNALS ONLY (INDICATOR VERSION)
+//  Derived from buy_sell.pine — original preserved in buy_sell_original_backup.pine
+//
+//  CORE CONCEPT (unchanged):
+//    A confluence score over six components decides BUY/SELL:
+//      1) EMA trend (price vs EMA + EMA slope)
+//      2) price confirmation (vs EMA)  — see "Fix Score" option below
+//      3) RSI momentum
+//      4) MACD momentum
+//      5) trendline break (structure)
+//      6) liquidity sweep (stop hunt)
+//    Modes: Strict (6/6) • Balanced (5/6) • Aggressive (4/6)
+//
+//  CHANGES IN THIS VERSION:
+//    • NO Stop-Loss / Take-Profit — the script plots BUY / SELL signals only.
+//    • MINIMUM MOVE FILTER: a signal is only plotted if price subsequently
+//      moves at least "Minimum Move" % in the signal's favour within a set
+//      number of bars. Signals that fail to do so are never plotted.
+//
+//  ⚠ IMPORTANT — WHY A SIGNAL APPEARS A FEW BARS LATE:
+//    "Reach the minimum move" depends on price AFTER the signal, and Pine
+//    Script can NOT see the future. To honour the rule without cheating, the
+//    script keeps each raw signal PENDING and only draws it once the required
+//    move has actually happened (within "Validate Within" bars). So:
+//      – qualifying signals show up a few bars after the confluence bar;
+//      – once drawn, a signal is permanent (it never repaints away);
+//      – the newest / live bars may not show a signal yet because it has not
+//        had time to reach the required move.
+//    To see signals immediately (no minimum-move rule), turn the filter OFF.
+//
+//  WHAT THIS INDICATOR DOES NOT DO:
+//    • It does not place orders and has no SL/TP. For order simulation use
+//      buy_sell_strategy.pine.
+// ============================================================================
+
+indicator("Smart Confluence BUY SELL • SIGNALS ONLY • Min-Move %", overlay=true,
+     max_labels_count=500, max_lines_count=500, max_boxes_count=200)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS  (groups 1–6 identical to the original script)
+//──────────────────────────────────────────────────────────────────────────────
+
+// Trend
+groupTrend  = "1 • Trend"
+emaLen      = input.int(50, "Trend EMA Length", minval=1, group=groupTrend)
+emaSlopeLen = input.int(3, "EMA Slope Lookback", minval=1, group=groupTrend)
+showEMA     = input.bool(true, "Show Red Trend EMA", group=groupTrend)
+
+// Market Structure
+groupMS  = "2 • Market Structure"
+pivotLen = input.int(5, "Swing Pivot Length", minval=2, maxval=30, group=groupMS)
+showSR   = input.bool(true, "Show Support / Resistance", group=groupMS)
+showTL   = input.bool(true, "Show Trendlines", group=groupMS)
+
+// Liquidity
+groupLiq      = "3 • Liquidity Sweeps"
+showLiquidity = input.bool(true, "Show Liquidity Sweeps", group=groupLiq)
+requireSweep  = input.bool(false, "Require Liquidity Sweep", group=groupLiq)
+
+// Momentum
+groupMom     = "4 • RSI + MACD"
+rsiLen       = input.int(14, "RSI Length", minval=2, group=groupMom)
+rsiBullLevel = input.float(50, "Bullish RSI Level", minval=1, maxval=99, group=groupMom)
+rsiBearLevel = input.float(50, "Bearish RSI Level", minval=1, maxval=99, group=groupMom)
+macdFast   = input.int(12, "MACD Fast", minval=1, group=groupMom)
+macdSlow   = input.int(26, "MACD Slow", minval=2, group=groupMom)
+macdSignal = input.int(9, "MACD Signal", minval=1, group=groupMom)
+
+// Fibonacci
+groupFib    = "5 • Fibonacci"
+showFib     = input.bool(true, "Show Fibonacci Levels", group=groupFib)
+fibLookback = input.int(100, "Fib Search Lookback", minval=20, group=groupFib)
+
+// Fair Value Gap (FVG)
+groupFVG = "6 • FVG / IFVG"
+showFVG  = input.bool(true, "Show Fair Value Gaps", group=groupFVG)
+showIFVG = input.bool(true, "Show Inverted FVG", group=groupFVG)
+maxFVG   = input.int(30, "Maximum FVG Boxes", minval=5, maxval=100, group=groupFVG)
+
+// Signal Engine
+groupSignal    = "7 • Signal Engine"
+signalMode     = input.string("Aggressive", "Signal Mode", options=["Strict", "Balanced", "Aggressive"], group=groupSignal)
+cooldownBars   = input.int(5, "Signal Cooldown Bars", minval=0, group=groupSignal)
+showScore      = input.bool(true, "Show Confluence Score", group=groupSignal)
+fixDoubleCount = input.bool(true, "Fix Score: Swap Duplicated EMA Point for FVG Confluence", group=groupSignal,
+     tooltip="Original scoring counts 'price vs EMA' twice (inside bullTrend AND as bullPriceConfirmation). When enabled, that second point is replaced by a fresh, unfilled Fair Value Gap — a genuinely different (SMC) piece of confluence. Disable to reproduce the original scoring exactly.")
+fvgScoreLen    = input.int(20, "FVG Confluence Lookback (bars)", minval=1, group=groupSignal)
+blockDuplicate = input.bool(true, "No New Signal While A Same-Direction Signal Is Pending", group=groupSignal)
+waitConfirm    = input.bool(true, "Confirmed Bars Only (recommended)", group=groupSignal)
+
+// Filters
+groupFilter  = "8 • Filters"
+useTrendGate = input.bool(true, "Require EMA Trend Alignment", group=groupFilter)
+useADXGate   = input.bool(false, "Block Sideways Markets (ADX)", group=groupFilter)
+adxLen       = input.int(14, "ADX Length", minval=1, group=groupFilter)
+adxSmooth    = input.int(14, "ADX Smoothing", minval=1, group=groupFilter)
+adxMin       = input.float(20.0, "Minimum ADX", minval=0, maxval=100, step=0.5, group=groupFilter)
+useATRGate   = input.bool(false, "Block Dead / Low-Volatility Markets (ATR regime)", group=groupFilter)
+atrAvgLen    = input.int(100, "ATR Average Length", minval=10, group=groupFilter)
+atrRatioMin  = input.float(0.7, "Min ATR / Average ATR", minval=0.1, step=0.1, group=groupFilter)
+useVolGate   = input.bool(false, "Require Above-Average Volume", group=groupFilter)
+volLen       = input.int(20, "Volume MA Length", minval=1, group=groupFilter)
+volMult      = input.float(1.0, "Volume MA Multiplier", minval=0.1, step=0.1, group=groupFilter)
+useHTFGate   = input.bool(false, "Require Higher-Timeframe EMA Alignment", group=groupFilter)
+htfTF        = input.timeframe("D", "Higher Timeframe", group=groupFilter)
+htfEmaLen    = input.int(50, "HTF EMA Length", minval=1, group=groupFilter)
+
+// Signal Quality
+groupQuality = "9 • Signal Quality (Minimum Move)"
+useMinPoints = input.bool(true, "Only Show Signals That Reach Minimum Move", group=groupQuality,
+     tooltip="When ON, a raw confluence signal is only plotted if price moves at least 'Minimum Move' % in its favour within 'Validate Within' bars. Because that depends on future price, the signal is drawn a few bars late (see the header note). Turn OFF to plot every confluence signal immediately.")
+minPct       = input.float(0.20, "Minimum Move (% of price)", minval=0.0, step=0.05, group=groupQuality,
+     tooltip="Signal must gain at least this % of its entry price. Scales to any instrument: e.g. 0.20% on BTC @ 80000 = ~$160, on ETH @ 2500 = ~$5. For crypto 5m, ~0.20% ≈ 1×ATR.")
+pointsWindow = input.int(20, "Validate Within (bars)", minval=1, group=groupQuality,
+     tooltip="How many bars the signal has to reach the minimum move before it is discarded.")
+adversePct   = input.float(0.0, "Discard If Moves Against (% of price, 0 = off)", minval=0.0, step=0.05, group=groupQuality,
+     tooltip="If price moves this % AGAINST the signal before reaching the target, the signal is discarded immediately. 0 disables this check (more signals).")
+dropOnReverse= input.bool(true, "Discard Pending If Opposite Signal Appears", group=groupQuality)
+
+// Display
+groupDisp = "10 • Display"
+labelSize = input.string("small", "Signal Label Size", options=["tiny", "small", "normal", "large"], group=groupDisp)
+
+// Alerts
+groupAlert   = "11 • Alerts"
+enableAlerts = input.bool(true, "Enable Alert Conditions", group=groupAlert)
+
+//──────────────────────────────────────────────────────────────────────────────
+// DERIVED INPUT VALUES
+//──────────────────────────────────────────────────────────────────────────────
+
+mint = syminfo.mintick
+
+lblSize = labelSize == "tiny" ? size.tiny : labelSize == "small" ? size.small : labelSize == "normal" ? size.normal : size.large
+
+//──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS & INDICATORS  (same math as the original script)
+//──────────────────────────────────────────────────────────────────────────────
+
+atrVal = ta.atr(14)
+
+// Trend EMA
+ema        = ta.ema(close, emaLen)
+emaRising  = ema > ema[emaSlopeLen]
+emaFalling = ema < ema[emaSlopeLen]
+
+bullTrend = close > ema and emaRising
+bearTrend = close < ema and emaFalling
+
+plot(showEMA ? ema : na, title="Trend EMA", color=color.rgb(190, 75, 55), linewidth=2)
+
+// RSI
+rsi     = ta.rsi(close, rsiLen)
+rsiBull = rsi > rsiBullLevel
+rsiBear = rsi < rsiBearLevel
+
+// MACD
+//   NOTE: macdHist = macdLine - signalLine, so "macdLine > signalLine and
+//   macdHist >= 0" is redundant — kept identical to the original so the
+//   signal definition does not silently change.
+[macdLine, signalLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+macdBull = macdLine > signalLine and macdHist >= 0
+macdBear = macdLine < signalLine and macdHist <= 0
+
+// Swing Highs & Lows
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float high1 = na, var float high2 = na
+var int highBar1 = na, var int highBar2 = na
+
+var float low1 = na, var float low2 = na
+var int lowBar1 = na, var int lowBar2 = na
+
+if not na(ph)
+    high2    := high1
+    highBar2 := highBar1
+    high1    := ph
+    highBar1 := bar_index - pivotLen
+
+if not na(pl)
+    low2    := low1
+    lowBar2 := lowBar1
+    low1    := pl
+    lowBar1 := bar_index - pivotLen
+
+// Dynamic S/R Lines
+var line srResLine = na
+var line srSupLine = na
+
+if showSR and not na(ph)
+    line.delete(srResLine)
+    srResLine := line.new(highBar1, high1, bar_index, high1, extend=extend.right, color=color.new(color.red, 40), width=1)
+
+if showSR and not na(pl)
+    line.delete(srSupLine)
+    srSupLine := line.new(lowBar1, low1, bar_index, low1, extend=extend.right, color=color.new(color.blue, 40), width=1)
+
+// Dynamic Trendlines
+var line bearishTL = na
+var line bullishTL = na
+
+if showTL and not na(ph) and not na(high2) and not na(highBar2)
+    line.delete(bearishTL)
+    bearishTL := line.new(highBar2, high2, highBar1, high1, extend=extend.right, color=color.new(color.red, 30), width=2)
+
+if showTL and not na(pl) and not na(low2) and not na(lowBar2)
+    line.delete(bullishTL)
+    bullishTL := line.new(lowBar2, low2, lowBar1, low1, extend=extend.right, color=color.new(color.green, 30), width=2)
+
+// Trendline Breaks (structure break — extrapolated trendline crossing)
+float resistanceValue = na
+float supportValue    = na
+
+if not na(highBar1) and not na(highBar2) and highBar1 != highBar2
+    highSlope = (high1 - high2) / (highBar1 - highBar2)
+    resistanceValue := high1 + highSlope * (bar_index - highBar1)
+
+if not na(lowBar1) and not na(lowBar2) and lowBar1 != lowBar2
+    lowSlope = (low1 - low2) / (lowBar1 - lowBar2)
+    supportValue := low1 + lowSlope * (bar_index - lowBar1)
+
+bullTrendlineBreak = not na(resistanceValue) and close > resistanceValue and close[1] <= resistanceValue[1]
+bearTrendlineBreak = not na(supportValue) and close < supportValue and close[1] >= supportValue[1]
+
+// Liquidity Sweeps
+bullSweep = not na(low1) and low < low1 and close > low1
+bearSweep = not na(high1) and high > high1 and close < high1
+
+plotshape(showLiquidity and bullSweep, title="Bullish Liquidity Sweep", style=shape.circle, location=location.belowbar, size=size.tiny, color=color.green, text="LS")
+plotshape(showLiquidity and bearSweep, title="Bearish Liquidity Sweep", style=shape.circle, location=location.abovebar, size=size.tiny, color=color.red, text="LS")
+
+// Fibonacci Retracements
+highestPrice = ta.highest(high, fibLookback)
+lowestPrice  = ta.lowest(low, fibLookback)
+fibRange     = highestPrice - lowestPrice
+
+fib214 = lowestPrice + fibRange * 0.214
+fib382 = lowestPrice + fibRange * 0.382
+fib500 = lowestPrice + fibRange * 0.500
+fib618 = lowestPrice + fibRange * 0.618
+fib705 = lowestPrice + fibRange * 0.705
+fib786 = lowestPrice + fibRange * 0.786
+
+plot(showFib ? fib382 : na, "Fib 38.2", color=color.new(color.gray, 65))
+plot(showFib ? fib500 : na, "Fib 50.0", color=color.new(color.gray, 55))
+plot(showFib ? fib618 : na, "Fib 61.8", color=color.new(color.orange, 30), linewidth=2)
+plot(showFib ? fib705 : na, "Fib 70.5", color=color.new(color.gray, 55))
+plot(showFib ? fib786 : na, "Fib 78.6", color=color.new(color.gray, 65))
+
+// Fair Value Gaps (FVG)
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+var box[] bullBoxes = array.new<box>()
+var box[] bearBoxes = array.new<box>()
+
+if showFVG and bullFVG
+    array.push(bullBoxes, box.new(left=bar_index - 2, top=low, right=bar_index, bottom=high[2], bgcolor=color.new(color.green, 88), border_color=color.new(color.green, 60)))
+
+if showFVG and bearFVG
+    array.push(bearBoxes, box.new(left=bar_index - 2, top=low[2], right=bar_index, bottom=high, bgcolor=color.new(color.red, 88), border_color=color.new(color.red, 60)))
+
+if showFVG
+    if array.size(bullBoxes) > 0
+        for i = array.size(bullBoxes) - 1 to 0
+            b = array.get(bullBoxes, i)
+            box.set_right(b, bar_index)
+            if close < box.get_bottom(b)
+                if showIFVG
+                    box.set_bgcolor(b, color.new(color.red, 90))
+                    box.set_border_color(b, color.new(color.red, 50))
+                else
+                    box.delete(b)
+                    array.remove(bullBoxes, i)
+
+    if array.size(bearBoxes) > 0
+        for i = array.size(bearBoxes) - 1 to 0
+            b = array.get(bearBoxes, i)
+            box.set_right(b, bar_index)
+            if close > box.get_top(b)
+                if showIFVG
+                    box.set_bgcolor(b, color.new(color.green, 90))
+                    box.set_border_color(b, color.new(color.green, 50))
+                else
+                    box.delete(b)
+                    array.remove(bearBoxes, i)
+
+while array.size(bullBoxes) > maxFVG
+    box.delete(array.shift(bullBoxes))
+
+while array.size(bearBoxes) > maxFVG
+    box.delete(array.shift(bearBoxes))
+
+// FVG confluence (6th score component when "Fix Score" is on: a recently
+// formed, still-unfilled gap = fresh smart-money-concept confluence)
+var float lastBullFVGbottom = na
+var int   lastBullFVGbar    = na
+var float lastBearFVGtop    = na
+var int   lastBearFVGbar    = na
+
+if bullFVG
+    lastBullFVGbottom := high[2]
+    lastBullFVGbar    := bar_index
+if bearFVG
+    lastBearFVGtop := low[2]
+    lastBearFVGbar := bar_index
+
+bullFVGfresh = not na(lastBullFVGbar) and (bar_index - lastBullFVGbar) <= fvgScoreLen and close > lastBullFVGbottom
+bearFVGfresh = not na(lastBearFVGbar) and (bar_index - lastBearFVGbar) <= fvgScoreLen and close < lastBearFVGtop
+
+//──────────────────────────────────────────────────────────────────────────────
+// FILTER CALCULATIONS
+//──────────────────────────────────────────────────────────────────────────────
+
+// ADX (sideways-market detector). nz(...,100) keeps warm-up bars unfiltered.
+[plusDI, minusDI, adxVal] = ta.dmi(adxLen, adxSmooth)
+adxOk = nz(adxVal, 100.0) >= adxMin
+
+// ATR regime (current volatility vs its own average)
+atrAvg   = ta.sma(atrVal, atrAvgLen)
+atrRatio = atrVal / atrAvg
+atrOk    = nz(atrRatio, 1.0) >= atrRatioMin
+
+// Volume confirmation (na-safe for instruments without volume)
+volMA = ta.sma(volume, volLen)
+volOk = na(volume) or na(volMA) or volume >= volMA * volMult
+
+// Higher-timeframe EMA alignment. [1] + lookahead_on returns the last
+// COMPLETED higher-timeframe bar → no lookahead, no repaint.
+htfEma = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfEmaLen)[1], lookahead=barmerge.lookahead_on)
+htfOk(longBias) =>
+    bool ok = true
+    if useHTFGate
+        ok := longBias ? close > htfEma : close < htfEma
+    ok
+
+//──────────────────────────────────────────────────────────────────────────────
+// CONFLUENCE SCORE & RAW SIGNALS
+//──────────────────────────────────────────────────────────────────────────────
+
+bullPriceConfirmation = close > ema
+bearPriceConfirmation = close < ema
+
+bullCompPrice = fixDoubleCount ? (bullFVGfresh ? 1 : 0) : (bullPriceConfirmation ? 1 : 0)
+bearCompPrice = fixDoubleCount ? (bearFVGfresh ? 1 : 0) : (bearPriceConfirmation ? 1 : 0)
+
+bullScore = (bullTrend ? 1 : 0) + bullCompPrice + (rsiBull ? 1 : 0) + (macdBull ? 1 : 0) + (bullTrendlineBreak ? 1 : 0) + (bullSweep ? 1 : 0)
+bearScore = (bearTrend ? 1 : 0) + bearCompPrice + (rsiBear ? 1 : 0) + (macdBear ? 1 : 0) + (bearTrendlineBreak ? 1 : 0) + (bearSweep ? 1 : 0)
+
+requiredScore = signalMode == "Strict" ? 6 : signalMode == "Balanced" ? 5 : 4
+
+bullSignalRaw = bullScore >= requiredScore and (not requireSweep or bullSweep)
+bearSignalRaw = bearScore >= requiredScore and (not requireSweep or bearSweep)
+
+//──────────────────────────────────────────────────────────────────────────────
+// PENDING-SIGNAL STORE
+//  A raw signal is held here until it either reaches the minimum move
+//  (→ drawn) or is discarded (moved against / timed out / opposite signal).
+//  Parallel arrays keep each pending signal's data together.
+//──────────────────────────────────────────────────────────────────────────────
+
+var int[]   pDir   = array.new<int>()     // 1 = long, -1 = short
+var int[]   pBar   = array.new<int>()     // signal bar index
+var float[] pEnt   = array.new<float>()   // reference price (signal close)
+var float[] pFav   = array.new<float>()   // best favourable price since signal
+var float[] pAdv   = array.new<float>()   // worst adverse price since signal
+var float[] pY     = array.new<float>()   // label anchor price
+var int[]   pScore = array.new<int>()     // confluence score at signal time
+
+var int cConfirmBuy  = 0
+var int cConfirmSell = 0
+var int cDropPoints  = 0
+var int cDropTime    = 0
+
+bool confirmedBuy  = false
+bool confirmedSell = false
+
+f_hasPending(int d) =>
+    bool found = false
+    if array.size(pDir) > 0
+        for i = 0 to array.size(pDir) - 1
+            if array.get(pDir, i) == d
+                found := true
+    found
+
+//──────────────────────────────────────────────────────────────────────────────
+// SIGNAL GATES (applied to RAW signals, before they enter the pending store)
+//──────────────────────────────────────────────────────────────────────────────
+
+var int cRawBuy      = 0
+var int cRawSell     = 0
+var int cBlkConflict = 0
+var int cBlkTrend    = 0
+var int cBlkADX      = 0
+var int cBlkATR      = 0
+var int cBlkVol      = 0
+var int cBlkHTF      = 0
+var int cBlkDup      = 0
+var int cBlkCool     = 0
+
+var int lastBuyBar  = na
+var int lastSellBar = na
+
+bool confOK = waitConfirm ? barstate.isconfirmed : true
+
+bool buy  = bullSignalRaw and confOK
+bool sell = bearSignalRaw and confOK
+if buy
+    cRawBuy += 1
+if sell
+    cRawSell += 1
+
+// 1) Trend gate
+if buy and useTrendGate and not bullTrend
+    buy := false
+    cBlkTrend += 1
+if sell and useTrendGate and not bearTrend
+    sell := false
+    cBlkTrend += 1
+// 2) ADX sideways gate
+if buy and useADXGate and not adxOk
+    buy := false
+    cBlkADX += 1
+if sell and useADXGate and not adxOk
+    sell := false
+    cBlkADX += 1
+// 3) ATR regime gate
+if buy and useATRGate and not atrOk
+    buy := false
+    cBlkATR += 1
+if sell and useATRGate and not atrOk
+    sell := false
+    cBlkATR += 1
+// 4) Volume gate
+if buy and useVolGate and not volOk
+    buy := false
+    cBlkVol += 1
+if sell and useVolGate and not volOk
+    sell := false
+    cBlkVol += 1
+// 5) Higher-timeframe gate
+if buy and not htfOk(true)
+    buy := false
+    cBlkHTF += 1
+if sell and not htfOk(false)
+    sell := false
+    cBlkHTF += 1
+// 6) Duplicate gate (a same-direction signal is already pending)
+if buy and blockDuplicate and f_hasPending(1)
+    buy := false
+    cBlkDup += 1
+if sell and blockDuplicate and f_hasPending(-1)
+    sell := false
+    cBlkDup += 1
+// 7) Cooldown gate
+if buy and not (na(lastBuyBar) or (bar_index - lastBuyBar > cooldownBars))
+    buy := false
+    cBlkCool += 1
+if sell and not (na(lastSellBar) or (bar_index - lastSellBar > cooldownBars))
+    sell := false
+    cBlkCool += 1
+// 8) Same-bar BUY/SELL conflict: higher score wins, tie = no signal
+if buy and sell
+    if bullScore > bearScore
+        sell := false
+        cBlkConflict += 1
+    else if bearScore > bullScore
+        buy := false
+        cBlkConflict += 1
+    else
+        buy  := false
+        sell := false
+        cBlkConflict += 2
+
+buySignal  = buy
+sellSignal = sell
+
+if buySignal
+    lastBuyBar := bar_index
+if sellSignal
+    lastSellBar := bar_index
+
+//──────────────────────────────────────────────────────────────────────────────
+// 1) VALIDATE PENDING SIGNALS (runs before new signals are added, so a fresh
+//    signal cannot be resolved on the bar it was created)
+//──────────────────────────────────────────────────────────────────────────────
+
+if useMinPoints and array.size(pDir) > 0
+    for i = array.size(pDir) - 1 to 0
+        int   d   = array.get(pDir, i)
+        int   b   = array.get(pBar, i)
+        float ent = array.get(pEnt, i)
+        float fav = array.get(pFav, i)
+        float adv = array.get(pAdv, i)
+        int   sc  = array.get(pScore, i)
+        float y   = array.get(pY, i)
+
+        if d == 1
+            fav := math.max(fav, high)
+            adv := math.min(adv, low)
+        else
+            fav := math.min(fav, low)
+            adv := math.max(adv, high)
+
+        float favMove  = d == 1 ? fav - ent : ent - fav
+        float advMove  = d == 1 ? ent - adv : adv - ent
+        bool  remove   = false
+
+        if favMove >= ent * minPct / 100.0
+            string txt = showScore ? (d == 1 ? "BUY " : "SELL ") + str.tostring(sc) + "/" + str.tostring(requiredScore) : (d == 1 ? "BUY" : "SELL")
+            color  c   = d == 1 ? color.rgb(58, 130, 91) : color.rgb(205, 91, 63)
+            label.new(x=b, y=y, text=txt, xloc=xloc.bar_index, yloc=yloc.price, style=d == 1 ? label.style_label_up : label.style_label_down, color=c, textcolor=color.white, size=lblSize)
+            if d == 1
+                cConfirmBuy  += 1
+                confirmedBuy := true
+            else
+                cConfirmSell += 1
+                confirmedSell := true
+            remove := true
+        else if adversePct > 0 and advMove >= ent * adversePct / 100.0
+            cDropPoints += 1
+            remove := true
+        else if (bar_index - b) >= pointsWindow
+            cDropTime += 1
+            remove := true
+
+        if remove
+            array.remove(pDir, i)
+            array.remove(pBar, i)
+            array.remove(pEnt, i)
+            array.remove(pFav, i)
+            array.remove(pAdv, i)
+            array.remove(pY, i)
+            array.remove(pScore, i)
+        else
+            array.set(pFav, i, fav)
+            array.set(pAdv, i, adv)
+
+//──────────────────────────────────────────────────────────────────────────────
+// 2) ADD NEW SIGNALS
+//    – with the minimum-points filter ON: push to the pending store;
+//    – with the filter OFF: draw immediately.
+//──────────────────────────────────────────────────────────────────────────────
+
+f_dropOpposite(int d) =>
+    if array.size(pDir) > 0
+        for i = array.size(pDir) - 1 to 0
+            if array.get(pDir, i) != d
+                array.remove(pDir, i)
+                array.remove(pBar, i)
+                array.remove(pEnt, i)
+                array.remove(pFav, i)
+                array.remove(pAdv, i)
+                array.remove(pY, i)
+                array.remove(pScore, i)
+
+f_drawNow(int d, int sc) =>
+    string txt = showScore ? (d == 1 ? "BUY " : "SELL ") + str.tostring(sc) + "/" + str.tostring(requiredScore) : (d == 1 ? "BUY" : "SELL")
+    color  c   = d == 1 ? color.rgb(58, 130, 91) : color.rgb(205, 91, 63)
+    label.new(x=bar_index, y=d == 1 ? low - atrVal * 0.3 : high + atrVal * 0.3, text=txt, xloc=xloc.bar_index, yloc=yloc.price, style=d == 1 ? label.style_label_up : label.style_label_down, color=c, textcolor=color.white, size=lblSize)
+
+if buySignal
+    if useMinPoints
+        if dropOnReverse
+            f_dropOpposite(1)
+        array.push(pDir, 1)
+        array.push(pBar, bar_index)
+        array.push(pEnt, close)
+        array.push(pFav, close)
+        array.push(pAdv, close)
+        array.push(pY, low - atrVal * 0.3)
+        array.push(pScore, bullScore)
+    else
+        f_drawNow(1, bullScore)
+
+if sellSignal
+    if useMinPoints
+        if dropOnReverse
+            f_dropOpposite(-1)
+        array.push(pDir, -1)
+        array.push(pBar, bar_index)
+        array.push(pEnt, close)
+        array.push(pFav, close)
+        array.push(pAdv, close)
+        array.push(pY, high + atrVal * 0.3)
+        array.push(pScore, bearScore)
+    else
+        f_drawNow(-1, bearScore)
+
+//──────────────────────────────────────────────────────────────────────────────
+// ALERTS & INFORMATION TABLE
+//──────────────────────────────────────────────────────────────────────────────
+
+alertcondition(enableAlerts and confirmedBuy, title="SMART BUY (confirmed)", message="SMART BUY signal confirmed: price reached the minimum move.")
+alertcondition(enableAlerts and confirmedSell, title="SMART SELL (confirmed)", message="SMART SELL signal confirmed: price reached the minimum move.")
+alertcondition(enableAlerts and bullSweep, title="Bullish Liquidity Sweep", message="Bullish liquidity sweep detected.")
+alertcondition(enableAlerts and bearSweep, title="Bearish Liquidity Sweep", message="Bearish liquidity sweep detected.")
+
+var table infoTable = table.new(position.top_right, 2, 19, border_width=1)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "SMART SIGNAL", text_color=color.white, bgcolor=color.rgb(40, 40, 40))
+    table.cell(infoTable, 1, 0, signalMode, text_color=color.white, bgcolor=color.rgb(40, 40, 40))
+    table.cell(infoTable, 0, 1, "TREND", text_color=color.white, bgcolor=color.rgb(55, 55, 55))
+    table.cell(infoTable, 1, 1, bullTrend ? "BULLISH" : bearTrend ? "BEARISH" : "NEUTRAL", text_color=color.white, bgcolor=color.rgb(55, 55, 55))
+    table.cell(infoTable, 0, 2, "RSI", text_color=color.white, bgcolor=color.rgb(55, 55, 55))
+    table.cell(infoTable, 1, 2, str.tostring(rsi, "#.0"), text_color=color.white, bgcolor=color.rgb(55, 55, 55))
+    table.cell(infoTable, 0, 3, "MACD", text_color=color.white, bgcolor=color.rgb(55, 55, 55))
+    table.cell(infoTable, 1, 3, macdBull ? "BULLISH" : macdBear ? "BEARISH" : "NEUTRAL", text_color=color.white, bgcolor=color.rgb(55, 55, 55))
+    table.cell(infoTable, 0, 4, "BUY SCORE", text_color=color.white, bgcolor=color.rgb(55, 55, 55))
+    table.cell(infoTable, 1, 4, str.tostring(bullScore) + "/" + str.tostring(requiredScore), text_color=color.white, bgcolor=color.rgb(55, 55, 55))
+    table.cell(infoTable, 0, 5, "SELL SCORE", text_color=color.white, bgcolor=color.rgb(55, 55, 55))
+    table.cell(infoTable, 1, 5, str.tostring(bearScore) + "/" + str.tostring(requiredScore), text_color=color.white, bgcolor=color.rgb(55, 55, 55))
+    table.cell(infoTable, 0, 6, "LIQUIDITY", text_color=color.white, bgcolor=color.rgb(55, 55, 55))
+    table.cell(infoTable, 1, 6, bullSweep ? "BUY SWEEP" : bearSweep ? "SELL SWEEP" : "NONE", text_color=color.white, bgcolor=color.rgb(55, 55, 55))
+    table.cell(infoTable, 0, 7, "MIN POINTS", text_color=color.white, bgcolor=color.rgb(45, 45, 45))
+    table.cell(infoTable, 1, 7, useMinPoints ? str.tostring(minPct, "#.##") + "% within " + str.tostring(pointsWindow) + " bars" : "FILTER OFF", text_color=color.white, bgcolor=color.rgb(45, 45, 45))
+    table.cell(infoTable, 0, 8, "CONFIRMED B / S", text_color=color.white, bgcolor=color.rgb(45, 45, 45))
+    table.cell(infoTable, 1, 8, str.tostring(cConfirmBuy) + " / " + str.tostring(cConfirmSell), text_color=color.white, bgcolor=color.rgb(45, 45, 45))
+    table.cell(infoTable, 0, 9, "PENDING NOW", text_color=color.white, bgcolor=color.rgb(45, 45, 45))
+    table.cell(infoTable, 1, 9, str.tostring(array.size(pDir)), text_color=color.white, bgcolor=color.rgb(45, 45, 45))
+    table.cell(infoTable, 0, 10, "DISCARDED % / time", text_color=color.white, bgcolor=color.rgb(50, 50, 50))
+    table.cell(infoTable, 1, 10, str.tostring(cDropPoints) + " / " + str.tostring(cDropTime), text_color=color.white, bgcolor=color.rgb(50, 50, 50))
+    table.cell(infoTable, 0, 11, "ADX", text_color=color.white, bgcolor=color.rgb(70, 70, 70))
+    table.cell(infoTable, 1, 11, str.tostring(adxVal, "#.0") + (adxOk ? " ok" : " LOW"), text_color=color.white, bgcolor=color.rgb(70, 70, 70))
+    table.cell(infoTable, 0, 12, "ATR RATIO", text_color=color.white, bgcolor=color.rgb(70, 70, 70))
+    table.cell(infoTable, 1, 12, str.tostring(atrRatio, "#.00"), text_color=color.white, bgcolor=color.rgb(70, 70, 70))
+    table.cell(infoTable, 0, 13, "VOLUME", text_color=color.white, bgcolor=color.rgb(70, 70, 70))
+    table.cell(infoTable, 1, 13, volOk ? "OK" : "LOW", text_color=color.white, bgcolor=color.rgb(70, 70, 70))
+    table.cell(infoTable, 0, 14, "HTF", text_color=color.white, bgcolor=color.rgb(70, 70, 70))
+    table.cell(infoTable, 1, 14, useHTFGate ? (htfOk(true) ? "BULL ALIGN" : htfOk(false) ? "BEAR ALIGN" : "AGAINST") : "OFF", text_color=color.white, bgcolor=color.rgb(70, 70, 70))
+    table.cell(infoTable, 0, 15, "RAW SIGNALS", text_color=color.white, bgcolor=color.rgb(45, 45, 45))
+    table.cell(infoTable, 1, 15, "B " + str.tostring(cRawBuy) + " / S " + str.tostring(cRawSell), text_color=color.white, bgcolor=color.rgb(45, 45, 45))
+    table.cell(infoTable, 0, 16, "BLOCKED: trend", text_color=color.white, bgcolor=color.rgb(50, 50, 50))
+    table.cell(infoTable, 1, 16, str.tostring(cBlkTrend), text_color=color.white, bgcolor=color.rgb(50, 50, 50))
+    table.cell(infoTable, 0, 17, "BLOCKED: adx/atr/vol/htf", text_color=color.white, bgcolor=color.rgb(50, 50, 50))
+    table.cell(infoTable, 1, 17, str.tostring(cBlkADX) + " / " + str.tostring(cBlkATR) + " / " + str.tostring(cBlkVol) + " / " + str.tostring(cBlkHTF), text_color=color.white, bgcolor=color.rgb(50, 50, 50))
+    table.cell(infoTable, 0, 18, "BLOCKED: dup/cool/conflict", text_color=color.white, bgcolor=color.rgb(50, 50, 50))
+    table.cell(infoTable, 1, 18, str.tostring(cBlkDup) + " / " + str.tostring(cBlkCool) + " / " + str.tostring(cBlkConflict), text_color=color.white, bgcolor=color.rgb(50, 50, 50))

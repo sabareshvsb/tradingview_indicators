@@ -1,0 +1,521 @@
+//@version=6
+// ============================================================================
+//  SMART CONFLUENCE BUY/SELL — SIGNALS ONLY STRATEGY (backtesting version)
+//  Same signal engine as buy_sell_optimized.pine, wrapped in strategy().
+//
+//  CHANGES IN THIS VERSION:
+//    • NO Stop-Loss and NO Take-Profit orders.
+//    • Entries happen on the raw confluence signal (order fills next bar open).
+//    • Exits happen on an OPPOSITE signal (see "On Opposite Signal").
+//    • MINIMUM-MOVE RULE (mirror of the indicator's filter): after entry, if
+//      the trade has NOT moved 'Minimum Move' % in its favour within 'Validate
+//      Within' bars — or has moved 'Discard If Moves Against' % against it
+//      — the trade is closed. Trades that DO reach the target are allowed to
+//      run until an opposite signal.
+//
+//  ⚠ WHY THE RULE IS APPLIED AS AN EXIT (not an entry filter):
+//    "Only enter signals that reach the minimum move" needs future data, which
+//    Pine cannot see. Entering at the signal and then closing early if the trade
+//    fails to reach the target is the honest, non-look-ahead equivalent — each
+//    surviving trade is one that did give at least the minimum move.
+//
+//  ORDER MODELLING:
+//    • Entries are market orders; with process_orders_on_close=false they fill
+//      at the NEXT bar's open (+ slippage).
+//    • Commission 0.05% per side and slippage 2 ticks are set in the
+//      strategy() line (constants — edit them there for your broker).
+//    • Order IDs must be constant strings in Pine (LONG / SHORT).
+// ============================================================================
+
+strategy("Smart Confluence BUY SELL — SIGNALS ONLY STRATEGY", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     commission_type=strategy.commission.percent, commission_value=0.05,
+     slippage=2,
+     pyramiding=0,
+     calc_on_every_tick=false, process_orders_on_close=false,
+     max_labels_count=500, max_lines_count=500, max_boxes_count=200)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS  (groups 1–6 identical to the original script)
+//──────────────────────────────────────────────────────────────────────────────
+
+groupTrend  = "1 • Trend"
+emaLen      = input.int(50, "Trend EMA Length", minval=1, group=groupTrend)
+emaSlopeLen = input.int(3, "EMA Slope Lookback", minval=1, group=groupTrend)
+showEMA     = input.bool(true, "Show Red Trend EMA", group=groupTrend)
+
+groupMS  = "2 • Market Structure"
+pivotLen = input.int(5, "Swing Pivot Length", minval=2, maxval=30, group=groupMS)
+
+groupLiq      = "3 • Liquidity Sweeps"
+requireSweep  = input.bool(false, "Require Liquidity Sweep", group=groupLiq)
+
+groupMom     = "4 • RSI + MACD"
+rsiLen       = input.int(14, "RSI Length", minval=2, group=groupMom)
+rsiBullLevel = input.float(50, "Bullish RSI Level", minval=1, maxval=99, group=groupMom)
+rsiBearLevel = input.float(50, "Bearish RSI Level", minval=1, maxval=99, group=groupMom)
+macdFast   = input.int(12, "MACD Fast", minval=1, group=groupMom)
+macdSlow   = input.int(26, "MACD Slow", minval=2, group=groupMom)
+macdSignal = input.int(9, "MACD Signal", minval=1, group=groupMom)
+
+groupSignal    = "7 • Signal Engine"
+signalMode     = input.string("Aggressive", "Signal Mode", options=["Strict", "Balanced", "Aggressive"], group=groupSignal)
+cooldownBars   = input.int(5, "Signal Cooldown Bars", minval=0, group=groupSignal)
+fixDoubleCount = input.bool(true, "Fix Score: Swap Duplicated EMA Point for FVG Confluence", group=groupSignal,
+     tooltip="Original scoring counts 'price vs EMA' twice. When enabled, that second point is replaced by a fresh unfilled Fair Value Gap. Disable to reproduce the original scoring exactly.")
+fvgScoreLen    = input.int(20, "FVG Confluence Lookback (bars)", minval=1, group=groupSignal)
+waitConfirm    = input.bool(true, "Confirmed Bars Only (recommended)", group=groupSignal)
+
+groupFilter  = "8 • Filters"
+useTrendGate = input.bool(true, "Require EMA Trend Alignment", group=groupFilter)
+useADXGate   = input.bool(false, "Block Sideways Markets (ADX)", group=groupFilter)
+adxLen       = input.int(14, "ADX Length", minval=1, group=groupFilter)
+adxSmooth    = input.int(14, "ADX Smoothing", minval=1, group=groupFilter)
+adxMin       = input.float(20.0, "Minimum ADX", minval=0, maxval=100, step=0.5, group=groupFilter)
+useATRGate   = input.bool(false, "Block Dead / Low-Volatility Markets (ATR regime)", group=groupFilter)
+atrAvgLen    = input.int(100, "ATR Average Length", minval=10, group=groupFilter)
+atrRatioMin  = input.float(0.7, "Min ATR / Average ATR", minval=0.1, step=0.1, group=groupFilter)
+useVolGate   = input.bool(false, "Require Above-Average Volume", group=groupFilter)
+volLen       = input.int(20, "Volume MA Length", minval=1, group=groupFilter)
+volMult      = input.float(1.0, "Volume MA Multiplier", minval=0.1, step=0.1, group=groupFilter)
+useHTFGate   = input.bool(false, "Require Higher-Timeframe EMA Alignment", group=groupFilter)
+htfTF        = input.timeframe("D", "Higher Timeframe", group=groupFilter)
+htfEmaLen    = input.int(50, "HTF EMA Length", minval=1, group=groupFilter)
+
+groupQuality = "9 • Signal Quality (Minimum Move)"
+useMinPoints = input.bool(true, "Apply Minimum-Move Rule", group=groupQuality,
+     tooltip="After entry, close the trade if it does not reach 'Minimum Move' % in its favour within 'Validate Within' bars (or moves 'Discard If Moves Against' % against it first). This is the honest, non-look-ahead mirror of the indicator's signal filter.")
+minPct       = input.float(0.20, "Minimum Move (% of price)", minval=0.0, step=0.05, group=groupQuality,
+     tooltip="Trade must gain at least this % of its entry price. Scales to any instrument: e.g. 0.20% on BTC @ 80000 = ~$160, on ETH @ 2500 = ~$5.")
+pointsWindow = input.int(20, "Validate Within (bars)", minval=1, group=groupQuality)
+adversePct   = input.float(0.0, "Discard If Moves Against (% of price, 0 = off)", minval=0.0, step=0.05, group=groupQuality,
+     tooltip="If price moves this % AGAINST the trade before reaching the target, the trade is closed immediately. 0 disables this check.")
+
+groupExec    = "10 • Execution & Sizing"
+sizingMode   = input.string("Fixed Quantity", "Position Sizing", options=["Fixed Quantity", "Risk % (ATR distance)"], group=groupExec)
+fixedQty     = input.float(1.0, "Fixed Quantity", minval=0.000001, group=groupExec)
+riskPct      = input.float(1.0, "Risk per Trade (% of Equity)", minval=0.01, step=0.1, group=groupExec)
+atrSizeMult  = input.float(1.5, "Sizing ATR Multiplier", minval=0.1, step=0.1, group=groupExec,
+     tooltip="For 'Risk % (ATR distance)': quantity = equity × risk% ÷ (ATR × this multiplier).")
+oppMode      = input.string("Reverse", "On Opposite Signal", options=["Reverse", "Close Only", "Ignore"], group=groupExec)
+useDateFilter= input.bool(false, "Limit Backtest Date Range", group=groupExec)
+startTime    = input.time(timestamp("01 Jan 2015 00:00 +0000"), "Start", group=groupExec)
+endTime      = input.time(timestamp("01 Jan 2030 00:00 +0000"), "End", group=groupExec)
+
+groupAlert   = "11 • Alerts"
+enableAlerts = input.bool(true, "Enable Alerts", group=groupAlert)
+
+//──────────────────────────────────────────────────────────────────────────────
+// DERIVED VALUES
+//──────────────────────────────────────────────────────────────────────────────
+
+mint   = syminfo.mintick
+inDate = not useDateFilter or (time >= startTime and time <= endTime)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INDICATORS (same math as the original / optimized indicator)
+//──────────────────────────────────────────────────────────────────────────────
+
+atrVal = ta.atr(14)
+
+ema        = ta.ema(close, emaLen)
+emaRising  = ema > ema[emaSlopeLen]
+emaFalling = ema < ema[emaSlopeLen]
+bullTrend  = close > ema and emaRising
+bearTrend  = close < ema and emaFalling
+
+plot(showEMA ? ema : na, title="Trend EMA", color=color.rgb(190, 75, 55), linewidth=2)
+
+rsi     = ta.rsi(close, rsiLen)
+rsiBull = rsi > rsiBullLevel
+rsiBear = rsi < rsiBearLevel
+
+[macdLine, signalLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+macdBull = macdLine > signalLine and macdHist >= 0
+macdBear = macdLine < signalLine and macdHist <= 0
+
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float high1 = na, var float high2 = na
+var int highBar1 = na, var int highBar2 = na
+var float low1 = na, var float low2 = na
+var int lowBar1 = na, var int lowBar2 = na
+
+if not na(ph)
+    high2    := high1
+    highBar2 := highBar1
+    high1    := ph
+    highBar1 := bar_index - pivotLen
+
+if not na(pl)
+    low2    := low1
+    lowBar2 := lowBar1
+    low1    := pl
+    lowBar1 := bar_index - pivotLen
+
+float resistanceValue = na
+float supportValue    = na
+
+if not na(highBar1) and not na(highBar2) and highBar1 != highBar2
+    highSlope = (high1 - high2) / (highBar1 - highBar2)
+    resistanceValue := high1 + highSlope * (bar_index - highBar1)
+if not na(lowBar1) and not na(lowBar2) and lowBar1 != lowBar2
+    lowSlope = (low1 - low2) / (lowBar1 - lowBar2)
+    supportValue := low1 + lowSlope * (bar_index - lowBar1)
+
+bullTrendlineBreak = not na(resistanceValue) and close > resistanceValue and close[1] <= resistanceValue[1]
+bearTrendlineBreak = not na(supportValue) and close < supportValue and close[1] >= supportValue[1]
+
+bullSweep = not na(low1) and low < low1 and close > low1
+bearSweep = not na(high1) and high > high1 and close < high1
+
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+var float lastBullFVGbottom = na
+var int   lastBullFVGbar    = na
+var float lastBearFVGtop    = na
+var int   lastBearFVGbar    = na
+
+if bullFVG
+    lastBullFVGbottom := high[2]
+    lastBullFVGbar    := bar_index
+if bearFVG
+    lastBearFVGtop := low[2]
+    lastBearFVGbar := bar_index
+
+bullFVGfresh = not na(lastBullFVGbar) and (bar_index - lastBullFVGbar) <= fvgScoreLen and close > lastBullFVGbottom
+bearFVGfresh = not na(lastBearFVGbar) and (bar_index - lastBearFVGbar) <= fvgScoreLen and close < lastBearFVGtop
+
+//──────────────────────────────────────────────────────────────────────────────
+// FILTERS
+//──────────────────────────────────────────────────────────────────────────────
+
+[plusDI, minusDI, adxVal] = ta.dmi(adxLen, adxSmooth)
+adxOk = nz(adxVal, 100.0) >= adxMin
+
+atrAvg   = ta.sma(atrVal, atrAvgLen)
+atrRatio = atrVal / atrAvg
+atrOk    = nz(atrRatio, 1.0) >= atrRatioMin
+
+volMA = ta.sma(volume, volLen)
+volOk = na(volume) or na(volMA) or volume >= volMA * volMult
+
+htfEma = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfEmaLen)[1], lookahead=barmerge.lookahead_on)
+htfOk(longBias) =>
+    bool ok = true
+    if useHTFGate
+        ok := longBias ? close > htfEma : close < htfEma
+    ok
+
+//──────────────────────────────────────────────────────────────────────────────
+// SCORE & RAW SIGNALS
+//──────────────────────────────────────────────────────────────────────────────
+
+bullPriceConfirmation = close > ema
+bearPriceConfirmation = close < ema
+
+bullCompPrice = fixDoubleCount ? (bullFVGfresh ? 1 : 0) : (bullPriceConfirmation ? 1 : 0)
+bearCompPrice = fixDoubleCount ? (bearFVGfresh ? 1 : 0) : (bearPriceConfirmation ? 1 : 0)
+
+bullScore = (bullTrend ? 1 : 0) + bullCompPrice + (rsiBull ? 1 : 0) + (macdBull ? 1 : 0) + (bullTrendlineBreak ? 1 : 0) + (bullSweep ? 1 : 0)
+bearScore = (bearTrend ? 1 : 0) + bearCompPrice + (rsiBear ? 1 : 0) + (macdBear ? 1 : 0) + (bearTrendlineBreak ? 1 : 0) + (bearSweep ? 1 : 0)
+
+requiredScore = signalMode == "Strict" ? 6 : signalMode == "Balanced" ? 5 : 4
+bullSignalRaw = bullScore >= requiredScore and (not requireSweep or bullSweep)
+bearSignalRaw = bearScore >= requiredScore and (not requireSweep or bearSweep)
+
+//──────────────────────────────────────────────────────────────────────────────
+// SIGNAL GATES
+//──────────────────────────────────────────────────────────────────────────────
+
+var int cRawBuy      = 0
+var int cRawSell     = 0
+var int cBlkConflict = 0
+var int cBlkTrend    = 0
+var int cBlkADX      = 0
+var int cBlkATR      = 0
+var int cBlkVol      = 0
+var int cBlkHTF      = 0
+var int cBlkCool     = 0
+
+var int lastBuyBar  = na
+var int lastSellBar = na
+
+bool confOK = waitConfirm ? barstate.isconfirmed : true
+
+bool buy  = bullSignalRaw and confOK and inDate
+bool sell = bearSignalRaw and confOK and inDate
+if buy
+    cRawBuy += 1
+if sell
+    cRawSell += 1
+
+if buy and useTrendGate and not bullTrend
+    buy := false
+    cBlkTrend += 1
+if sell and useTrendGate and not bearTrend
+    sell := false
+    cBlkTrend += 1
+if buy and useADXGate and not adxOk
+    buy := false
+    cBlkADX += 1
+if sell and useADXGate and not adxOk
+    sell := false
+    cBlkADX += 1
+if buy and useATRGate and not atrOk
+    buy := false
+    cBlkATR += 1
+if sell and useATRGate and not atrOk
+    sell := false
+    cBlkATR += 1
+if buy and useVolGate and not volOk
+    buy := false
+    cBlkVol += 1
+if sell and useVolGate and not volOk
+    sell := false
+    cBlkVol += 1
+if buy and not htfOk(true)
+    buy := false
+    cBlkHTF += 1
+if sell and not htfOk(false)
+    sell := false
+    cBlkHTF += 1
+if buy and not (na(lastBuyBar) or (bar_index - lastBuyBar > cooldownBars))
+    buy := false
+    cBlkCool += 1
+if sell and not (na(lastSellBar) or (bar_index - lastSellBar > cooldownBars))
+    sell := false
+    cBlkCool += 1
+if buy and sell
+    if bullScore > bearScore
+        sell := false
+        cBlkConflict += 1
+    else if bearScore > bullScore
+        buy := false
+        cBlkConflict += 1
+    else
+        buy  := false
+        sell := false
+        cBlkConflict += 2
+
+buySignal  = buy
+sellSignal = sell
+
+if buySignal
+    lastBuyBar := bar_index
+if sellSignal
+    lastSellBar := bar_index
+
+//──────────────────────────────────────────────────────────────────────────────
+// EXECUTION STATE
+//──────────────────────────────────────────────────────────────────────────────
+
+var int   oDir      = 0       // direction of the currently OPEN position
+var bool  oFilled   = false
+var float oEntry    = na
+var int   oEntryBar = na
+var float oFav      = na
+var float oAdv      = na
+var bool  oValidated= false
+
+var int   pendDir   = 0       // entry ordered, waiting for the fill
+var int   pendBar   = na
+var float pendQty   = na
+
+var float lastNet     = 0.0
+var float peakEq      = na
+var float maxDDpct    = 0.0
+
+var int   nLong = 0, var int nShort = 0
+var int   wLong = 0, var int wShort = 0
+var float pLong = 0.0, var float pShort = 0.0
+var int   nValid = 0
+
+bool posLong  = strategy.position_size > 0
+bool posShort = strategy.position_size < 0
+bool posFlat  = strategy.position_size == 0
+
+f_calcQty() =>
+    float q = na
+    if sizingMode == "Fixed Quantity"
+        q := fixedQty
+    else
+        float dist = atrVal * atrSizeMult
+        if dist >= mint
+            q := (strategy.equity * riskPct / 100.0) / dist
+    q
+
+f_drawLabel(int d, int sc) =>
+    string txt = (d == 1 ? "BUY " : "SELL ") + str.tostring(sc) + "/" + str.tostring(requiredScore)
+    color  c   = d == 1 ? color.rgb(58, 130, 91) : color.rgb(205, 91, 63)
+    label.new(x=bar_index, y=d == 1 ? low - atrVal * 0.3 : high + atrVal * 0.3, text=txt, xloc=xloc.bar_index, yloc=yloc.price, style=d == 1 ? label.style_label_up : label.style_label_down, color=c, textcolor=color.white, size=size.small)
+
+// ── 1) position closed (or reversed) → book the trade ───────────────────────
+if oFilled and ((oDir == 1 and not posLong) or (oDir == -1 and not posShort))
+    float pnl = strategy.netprofit - lastNet
+    lastNet := strategy.netprofit
+    if oDir == 1
+        nLong += 1
+        pLong += pnl
+        if pnl > 0
+            wLong += 1
+    else
+        nShort += 1
+        pShort += pnl
+        if pnl > 0
+            wShort += 1
+    oDir := 0
+    oFilled := false
+    oValidated := false
+
+// ── 2) pending entry: did it fill? ──────────────────────────────────────────
+if pendDir != 0
+    bool gotFill = (pendDir == 1 and posLong) or (pendDir == -1 and posShort)
+    if gotFill
+        oDir := pendDir
+        oFilled := true
+        oValidated := false
+        oEntry := strategy.position_avg_price
+        oEntryBar := bar_index
+        oFav := oEntry
+        oAdv := oEntry
+        f_drawLabel(pendDir, pendDir == 1 ? bullScore : bearScore)
+        pendDir := 0
+    else if not na(pendBar) and bar_index > pendBar
+        pendDir := 0
+
+// ── 3) minimum-points rule (mirror of the indicator filter) ─────────────────
+if oFilled
+    oFav := oDir == 1 ? math.max(oFav, high) : math.min(oFav, low)
+    oAdv := oDir == 1 ? math.min(oAdv, low) : math.max(oAdv, high)
+    float favMove = oDir == 1 ? oFav - oEntry : oEntry - oFav
+    float advMove = oDir == 1 ? oEntry - oAdv : oAdv - oEntry
+    if useMinPoints and not oValidated
+        if favMove >= oEntry * minPct / 100.0
+            oValidated := true
+            nValid += 1
+        else
+            bool kill = false
+            if adversePct > 0 and advMove >= oEntry * adversePct / 100.0
+                kill := true
+            else if bar_index - oEntryBar >= pointsWindow
+                kill := true
+            if kill
+                if oDir == 1
+                    strategy.close("LONG", comment="min-move fail")
+                else
+                    strategy.close("SHORT", comment="min-move fail")
+
+// ── 4) new signals → place entries ──────────────────────────────────────────
+if buySignal and pendDir == 0
+    if posFlat
+        float q = f_calcQty()
+        if not na(q) and q > 0
+            pendDir := 1
+            pendBar := bar_index
+            pendQty := q
+            strategy.entry("LONG", strategy.long, qty=q, comment="BUY", alert_message="BUY")
+    else if posShort
+        if oppMode == "Reverse"
+            float q2 = f_calcQty()
+            if not na(q2) and q2 > 0
+                pendDir := 1
+                pendBar := bar_index
+                pendQty := q2
+                strategy.entry("LONG", strategy.long, qty=q2, comment="BUY (reverse)", alert_message="BUY")
+        else if oppMode == "Close Only"
+            strategy.close("SHORT", comment="opposite signal")
+
+if sellSignal and pendDir == 0
+    if posFlat
+        float q = f_calcQty()
+        if not na(q) and q > 0
+            pendDir := -1
+            pendBar := bar_index
+            pendQty := q
+            strategy.entry("SHORT", strategy.short, qty=q, comment="SELL", alert_message="SELL")
+    else if posLong
+        if oppMode == "Reverse"
+            float q2 = f_calcQty()
+            if not na(q2) and q2 > 0
+                pendDir := -1
+                pendBar := bar_index
+                pendQty := q2
+                strategy.entry("SHORT", strategy.short, qty=q2, comment="SELL (reverse)", alert_message="SELL")
+        else if oppMode == "Close Only"
+            strategy.close("LONG", comment="opposite signal")
+
+//──────────────────────────────────────────────────────────────────────────────
+// EQUITY TRACKING (drawdown %) & ALERTS
+//──────────────────────────────────────────────────────────────────────────────
+
+peakEq := math.max(nz(peakEq, strategy.initial_capital), strategy.equity)
+float ddNow = peakEq > 0 ? (peakEq - strategy.equity) / peakEq * 100.0 : 0.0
+maxDDpct := math.max(maxDDpct, ddNow)
+
+if enableAlerts and buySignal
+    alert("SMART BUY signal", alert.freq_once_per_bar_close)
+if enableAlerts and sellSignal
+    alert("SMART SELL signal", alert.freq_once_per_bar_close)
+
+//──────────────────────────────────────────────────────────────────────────────
+// RESULTS TABLE
+//──────────────────────────────────────────────────────────────────────────────
+
+var table st = table.new(position.top_right, 2, 18, border_width=1)
+
+f_pct(float x) =>
+    str.tostring(x, "#.##")
+
+if barstate.islast
+    int   nTot   = strategy.closedtrades
+    int   nWin   = strategy.wintrades
+    int   nLoss  = strategy.losstrades
+    float wr     = nTot > 0 ? nWin / nTot * 100.0 : 0.0
+    float netP   = strategy.netprofit
+    float retPct = strategy.initial_capital > 0 ? netP / strategy.initial_capital * 100.0 : 0.0
+    float pf     = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
+    float avgWin = nWin  > 0 ? strategy.grossprofit / nWin  : 0.0
+    float avgLos = nLoss > 0 ? strategy.grossloss  / nLoss  : 0.0
+    float expct  = nTot  > 0 ? netP / nTot : 0.0
+    color hd = color.rgb(30, 30, 30)
+    color bg = color.rgb(55, 55, 55)
+
+    table.cell(st, 0, 0, "STRATEGY RESULTS (no SL/TP)", text_color=color.white, bgcolor=hd)
+    table.cell(st, 1, 0, signalMode, text_color=color.white, bgcolor=hd)
+    table.cell(st, 0, 1, "Closed trades", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 1, str.tostring(nTot), text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 2, "Win rate", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 2, f_pct(wr) + " %", text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 3, "Net profit", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 3, f_pct(netP) + " (" + f_pct(retPct) + " %)", text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 4, "Profit factor", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 4, na(pf) ? "n/a" : f_pct(pf), text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 5, "Avg win / Avg loss", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 5, f_pct(avgWin) + " / " + f_pct(avgLos), text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 6, "Expectancy / trade", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 6, f_pct(expct), text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 7, "Max drawdown", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 7, f_pct(strategy.max_drawdown) + " (" + f_pct(maxDDpct) + " %)", text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 8, "Long: n / win / net", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 8, str.tostring(nLong) + " / " + f_pct(nLong > 0 ? wLong / nLong * 100.0 : 0) + " % / " + f_pct(pLong), text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 9, "Short: n / win / net", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 9, str.tostring(nShort) + " / " + f_pct(nShort > 0 ? wShort / nShort * 100.0 : 0) + " % / " + f_pct(pShort), text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 10, "Open position", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 10, posLong ? "LONG " + str.tostring(strategy.position_size) : posShort ? "SHORT " + str.tostring(strategy.position_size) : "flat", text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 11, "Min-move rule", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 11, useMinPoints ? str.tostring(minPct, "#.##") + "% within " + str.tostring(pointsWindow) + " bars" : "OFF", text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 12, "Validated trades", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 12, str.tostring(nValid), text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 13, "Sizing", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 13, sizingMode == "Fixed Quantity" ? "fixed " + str.tostring(fixedQty) : f_pct(riskPct) + " % risk (ATR)", text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 14, "RAW signals B / S", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 14, str.tostring(cRawBuy) + " / " + str.tostring(cRawSell), text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 15, "Data range (bars)", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 15, str.tostring(bar_index), text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 16, "Chart / TF", text_color=color.white, bgcolor=bg)
+    table.cell(st, 1, 16, syminfo.ticker + " " + timeframe.period, text_color=color.white, bgcolor=bg)
+    table.cell(st, 0, 17, "NOTE", text_color=color.white, bgcolor=hd)
+    table.cell(st, 1, 17, "no SL/TP; exits on opposite signal or min-move fail", text_color=color.white, bgcolor=hd)
